@@ -45,10 +45,10 @@ type fakeClassifier struct {
 	desc   string
 }
 
-func (f *fakeClassifier) Classify(_ context.Context, title, desc string, _ []classifier.Category) (string, error) {
+func (f *fakeClassifier) Classify(_ context.Context, title, desc string, _ []classifier.Category) (string, classifier.Usage, error) {
 	f.calls++
 	f.title, f.desc = title, desc
-	return f.answer, f.err
+	return f.answer, classifier.Usage{Model: "test", InputTokens: 10, OutputTokens: 5}, f.err
 }
 
 func newPage(category string) *notion.Page {

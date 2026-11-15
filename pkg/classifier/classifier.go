@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -21,7 +22,16 @@ var ErrBadAnswer = errors.New("classifier: unusable answer")
 
 const systemPrompt = `You categorize items from a task list. Given a task's title and description, choose the single category from the provided list that best fits it.
 
-Base the choice on what the work actually is, not on incidental words. When the task is vague, pick the closest fit; the list is the only set of valid answers.`
+Base the choice on what the work actually is, not on incidental words. When the task is vague, pick the closest fit; the list is the only set of valid answers. If no category fits and the list contains "Não encontrado", choose it.`
+
+// Usage is the token consumption of one Classify call.
+type Usage struct {
+	Model            string
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+}
 
 // Category is one option the model may choose.
 type Category struct {
@@ -45,9 +55,9 @@ func New(opts ...option.RequestOption) *Classifier {
 // Classify returns the name of the category that best fits the task. The
 // answer is constrained by a JSON schema enum, so it is always one of
 // categories.
-func (c *Classifier) Classify(ctx context.Context, title, description string, categories []Category) (string, error) {
+func (c *Classifier) Classify(ctx context.Context, title, description string, categories []Category) (string, Usage, error) {
 	if len(categories) == 0 {
-		return "", errors.New("classifier: no categories to choose from")
+		return "", Usage{}, errors.New("classifier: no categories to choose from")
 	}
 
 	names := make([]string, len(categories))
@@ -89,14 +99,27 @@ func (c *Classifier) Classify(ctx context.Context, title, description string, ca
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("classifier: %w", err)
+		return "", Usage{}, fmt.Errorf("classifier: %w", err)
+	}
+
+	// One greppable line per call, so usage can be summed from the logs.
+	log.Printf("usage: input_tokens=%d output_tokens=%d cache_read=%d cache_write=%d",
+		resp.Usage.InputTokens, resp.Usage.OutputTokens,
+		resp.Usage.CacheReadInputTokens, resp.Usage.CacheCreationInputTokens)
+
+	u := Usage{
+		Model:            model,
+		InputTokens:      int64(resp.Usage.InputTokens),
+		OutputTokens:     int64(resp.Usage.OutputTokens),
+		CacheReadTokens:  int64(resp.Usage.CacheReadInputTokens),
+		CacheWriteTokens: int64(resp.Usage.CacheCreationInputTokens),
 	}
 
 	switch resp.StopReason {
 	case anthropic.StopReasonRefusal:
-		return "", fmt.Errorf("%w: model refused (%s)", ErrBadAnswer, resp.StopDetails.Category)
+		return "", u, fmt.Errorf("%w: model refused (%s)", ErrBadAnswer, resp.StopDetails.Category)
 	case anthropic.StopReasonMaxTokens:
-		return "", fmt.Errorf("%w: hit max_tokens before answering", ErrBadAnswer)
+		return "", u, fmt.Errorf("%w: hit max_tokens before answering", ErrBadAnswer)
 	}
 
 	var text strings.Builder
@@ -109,12 +132,12 @@ func (c *Classifier) Classify(ctx context.Context, title, description string, ca
 		Category string `json:"category"`
 	}
 	if err := json.Unmarshal([]byte(text.String()), &out); err != nil {
-		return "", fmt.Errorf("%w: parse %q: %v", ErrBadAnswer, text.String(), err)
+		return "", u, fmt.Errorf("%w: parse %q: %v", ErrBadAnswer, text.String(), err)
 	}
 	for _, n := range names {
 		if n == out.Category {
-			return n, nil
+			return n, u, nil
 		}
 	}
-	return "", fmt.Errorf("%w: unknown category %q", ErrBadAnswer, out.Category)
+	return "", u, fmt.Errorf("%w: unknown category %q", ErrBadAnswer, out.Category)
 }

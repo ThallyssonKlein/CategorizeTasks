@@ -16,11 +16,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 
 	"github.com/thallyssonklein/categorize-tasks/pkg/classifier"
 	"github.com/thallyssonklein/categorize-tasks/pkg/notion"
+	"github.com/thallyssonklein/categorize-tasks/pkg/usage"
 )
 
 // Notion is the subset of the Notion API the handler uses.
@@ -32,7 +34,7 @@ type Notion interface {
 
 // Classifier picks a category for a task.
 type Classifier interface {
-	Classify(ctx context.Context, title, description string, categories []classifier.Category) (string, error)
+	Classify(ctx context.Context, title, description string, categories []classifier.Category) (string, classifier.Usage, error)
 }
 
 type Config struct {
@@ -46,6 +48,12 @@ type Config struct {
 	// database. The title property is found by type.
 	DescriptionProperty string
 	CategoryProperty    string
+	// FallbackCategory is the select option used when the model cannot pick
+	// one (refusal, truncation, invalid answer). It must exist in the select.
+	// Empty disables the fallback.
+	FallbackCategory string
+	// DryRun classifies (and logs token usage) but never writes to Notion.
+	DryRun bool
 	// Paused acknowledges every event without processing it.
 	Paused bool
 }
@@ -57,6 +65,8 @@ func ConfigFromEnv() Config {
 		DatabaseID:          os.Getenv("NOTION_DATABASE_ID"),
 		DescriptionProperty: envOr("NOTION_DESCRIPTION_PROPERTY", "Description"),
 		CategoryProperty:    envOr("NOTION_CATEGORY_PROPERTY", "Category"),
+		FallbackCategory:    envOr("NOTION_FALLBACK_CATEGORY", "Não encontrado"),
+		DryRun:              os.Getenv("DRY_RUN") == "true",
 		Paused:              os.Getenv("WEBHOOK_PAUSED") == "true",
 	}
 }
@@ -65,6 +75,14 @@ type Handler struct {
 	cfg        Config
 	notion     Notion
 	classifier Classifier
+	usage      usage.Recorder
+}
+
+// WithUsage makes the handler save token usage of every classification.
+// Failures to save are logged and never fail the event.
+func (h *Handler) WithUsage(r usage.Recorder) *Handler {
+	h.usage = r
+	return h
 }
 
 func NewHandler(cfg Config, n Notion, c Classifier) *Handler {
@@ -216,11 +234,22 @@ func (h *Handler) process(ctx context.Context, ev Event) error {
 		return err
 	}
 
-	category, err := h.classifier.Classify(ctx, title, description, categories)
+	category, u, err := h.classifier.Classify(ctx, title, description, categories)
+	if errors.Is(err, classifier.ErrBadAnswer) && h.cfg.FallbackCategory != "" {
+		log.Printf("event %s: page %s: %v; using %q", ev.ID, page.ID, err, h.cfg.FallbackCategory)
+		category, err = h.cfg.FallbackCategory, nil
+	}
+	if u.Model != "" {
+		h.saveUsage(ctx, ev.ID, page.ID, category, u)
+	}
 	if err != nil {
 		return err
 	}
 
+	if h.cfg.DryRun {
+		log.Printf("event %s: dry-run: page %s %q would be %q", ev.ID, page.ID, title, category)
+		return nil
+	}
 	if catProp.Select != nil && catProp.Select.Name == category {
 		return skip("category already %q", category)
 	}
@@ -229,6 +258,21 @@ func (h *Handler) process(ctx context.Context, ev Event) error {
 	}
 	log.Printf("event %s: page %s %q -> %q", ev.ID, page.ID, title, category)
 	return nil
+}
+
+func (h *Handler) saveUsage(ctx context.Context, eventID, pageID, category string, u classifier.Usage) {
+	if h.usage == nil {
+		return
+	}
+	err := h.usage.Record(ctx, usage.Record{
+		EventID: eventID, Time: time.Now().UTC(), PageID: pageID, Model: u.Model,
+		InputTokens: u.InputTokens, OutputTokens: u.OutputTokens,
+		CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens,
+		Category: category, DryRun: h.cfg.DryRun,
+	})
+	if err != nil {
+		log.Printf("event %s: %v", eventID, err)
+	}
 }
 
 func categoriesOf(ds *notion.DataSource, property string) ([]classifier.Category, error) {
