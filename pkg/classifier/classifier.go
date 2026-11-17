@@ -16,6 +16,15 @@ import (
 
 const model = "claude-haiku-5-5"
 
+const (
+	// The Anthropic API rate limits (requests/tokens per minute) depend on the
+	// account's usage tier. Traffic here is one request per webhook event, so
+	// the SDK's built-in retry (which honors Retry-After on 429/5xx) is the
+	// throttle; revisit with a rate.Limiter if classification becomes parallel.
+	requestTimeout = 20 * time.Second
+	maxRetries     = 2
+)
+
 // ErrBadAnswer wraps responses that cannot be turned into a category
 // (refusal, truncation, invalid JSON). Retrying the same input rarely helps.
 var ErrBadAnswer = errors.New("classifier: unusable answer")
@@ -46,8 +55,8 @@ type Classifier struct {
 // New builds a classifier. The API key is read from ANTHROPIC_API_KEY.
 func New(opts ...option.RequestOption) *Classifier {
 	opts = append([]option.RequestOption{
-		option.WithRequestTimeout(20 * time.Second),
-		option.WithMaxRetries(2),
+		option.WithRequestTimeout(requestTimeout),
+		option.WithMaxRetries(maxRetries),
 	}, opts...)
 	return &Classifier{client: anthropic.NewClient(opts...)}
 }

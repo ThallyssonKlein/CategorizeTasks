@@ -6,11 +6,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -19,13 +24,34 @@ const (
 	APIVersion = "2026-03-11"
 )
 
+const (
+	// Notion documents an average of 3 requests per second per integration,
+	// with some burst allowed.
+	// https://developers.notion.com/reference/request-limits
+	requestsPerSecond = 3
+	requestBurst      = 3
+
+	// maxRetries bounds retries on 429/503; each retry is a new request and
+	// goes through the limiter again.
+	maxRetries     = 3
+	defaultBackoff = 500 * time.Millisecond
+	maxBackoff     = 8 * time.Second
+	requestTimeout = 15 * time.Second
+)
+
 type Client struct {
 	token string
 	http  *http.Client
+	// limiter is shared by every goroutine using this client.
+	limiter *rate.Limiter
 }
 
 func NewClient(token string) *Client {
-	return &Client{token: token, http: &http.Client{Timeout: 15 * time.Second}}
+	return &Client{
+		token:   token,
+		http:    &http.Client{Timeout: requestTimeout},
+		limiter: rate.NewLimiter(rate.Limit(requestsPerSecond), requestBurst),
+	}
 }
 
 // APIError is returned when Notion answers with a non-2xx status.
@@ -118,32 +144,62 @@ func (c *Client) SetSelect(ctx context.Context, pageID, property, option string)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	var reqBody io.Reader
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reqBody = bytes.NewReader(b)
+		payload = b
+	}
+
+	for attempt := 0; ; attempt++ {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return fmt.Errorf("notion: waiting for rate limit: %w", err)
+		}
+		wait, err := c.attempt(ctx, method, path, payload, out)
+		var apiErr *APIError
+		retry := errors.As(err, &apiErr) &&
+			(apiErr.Status == http.StatusTooManyRequests || apiErr.Status == http.StatusServiceUnavailable)
+		if !retry || attempt >= maxRetries {
+			return err
+		}
+		if wait <= 0 {
+			wait = backoff(attempt)
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// attempt performs one request. On an API error it also returns the delay
+// requested by the Retry-After header, or 0 when absent.
+func (c *Client) attempt(ctx context.Context, method, path string, payload []byte, out any) (time.Duration, error) {
+	var reqBody io.Reader
+	if payload != nil {
+		reqBody = bytes.NewReader(payload)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, reqBody)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Notion-Version", APIVersion)
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("notion: %s %s: %w", method, path, err)
+		return 0, fmt.Errorf("notion: %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if resp.StatusCode/100 != 2 {
 		apiErr := &APIError{Status: resp.StatusCode}
@@ -151,12 +207,27 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			apiErr.Message = strings.TrimSpace(string(data))
 		}
 		apiErr.Status = resp.StatusCode
-		return apiErr
+		return retryAfter(resp.Header), apiErr
 	}
 	if out != nil {
-		return json.Unmarshal(data, out)
+		return 0, json.Unmarshal(data, out)
 	}
-	return nil
+	return 0, nil
+}
+
+// retryAfter parses the Retry-After header (seconds), capped at maxBackoff.
+func retryAfter(h http.Header) time.Duration {
+	secs, err := strconv.Atoi(h.Get("Retry-After"))
+	if err != nil || secs < 0 {
+		return 0
+	}
+	return min(time.Duration(secs)*time.Second, maxBackoff)
+}
+
+// backoff is exponential with full jitter.
+func backoff(attempt int) time.Duration {
+	d := min(defaultBackoff<<attempt, maxBackoff)
+	return d/2 + rand.N(d/2+1)
 }
 
 // PlainText joins the plain text of a title or rich_text property.
