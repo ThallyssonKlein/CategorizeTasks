@@ -27,6 +27,9 @@ type Record struct {
 	CacheWriteTokens int64     `bson:"cache_write_tokens"`
 	Category         string    `bson:"category"`
 	DryRun           bool      `bson:"dry_run"`
+	// Estimated marks records where the model was not run: input tokens are
+	// exact (count_tokens), output tokens are an estimate.
+	Estimated bool `bson:"estimated"`
 }
 
 // Recorder persists usage records.

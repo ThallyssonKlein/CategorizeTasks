@@ -43,12 +43,19 @@ type fakeClassifier struct {
 	calls  int
 	title  string
 	desc   string
+	// estimates counts Estimate calls.
+	estimates int
 }
 
 func (f *fakeClassifier) Classify(_ context.Context, title, desc string, _ []classifier.Category) (string, classifier.Usage, error) {
 	f.calls++
 	f.title, f.desc = title, desc
 	return f.answer, classifier.Usage{Model: "test", InputTokens: 10, OutputTokens: 5}, f.err
+}
+
+func (f *fakeClassifier) Estimate(_ context.Context, _, _ string, _ []classifier.Category) (classifier.Usage, error) {
+	f.estimates++
+	return classifier.Usage{Model: "test", InputTokens: 10, OutputTokens: 5, Estimated: true}, f.err
 }
 
 func newPage(category string) *notion.Page {

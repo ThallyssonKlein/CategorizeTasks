@@ -35,6 +35,7 @@ type Notion interface {
 // Classifier picks a category for a task.
 type Classifier interface {
 	Classify(ctx context.Context, title, description string, categories []classifier.Category) (string, classifier.Usage, error)
+	Estimate(ctx context.Context, title, description string, categories []classifier.Category) (classifier.Usage, error)
 }
 
 type Config struct {
@@ -52,7 +53,8 @@ type Config struct {
 	// one (refusal, truncation, invalid answer). It must exist in the select.
 	// Empty disables the fallback.
 	FallbackCategory string
-	// DryRun classifies (and logs token usage) but never writes to Notion.
+	// DryRun never runs the model nor writes to Notion: it only counts the
+	// tokens a classification would use (free count_tokens call) and saves them.
 	DryRun bool
 	// Paused acknowledges every event without processing it.
 	Paused bool
@@ -234,6 +236,17 @@ func (h *Handler) process(ctx context.Context, ev Event) error {
 		return err
 	}
 
+	if h.cfg.DryRun {
+		u, err := h.classifier.Estimate(ctx, title, description, categories)
+		if err != nil {
+			return err
+		}
+		h.saveUsage(ctx, ev.ID, page.ID, "", u)
+		log.Printf("event %s: dry-run: page %s %q: ~%d input + ~%d output tokens (not classified)",
+			ev.ID, page.ID, title, u.InputTokens, u.OutputTokens)
+		return nil
+	}
+
 	category, u, err := h.classifier.Classify(ctx, title, description, categories)
 	if errors.Is(err, classifier.ErrBadAnswer) && h.cfg.FallbackCategory != "" {
 		log.Printf("event %s: page %s: %v; using %q", ev.ID, page.ID, err, h.cfg.FallbackCategory)
@@ -246,10 +259,6 @@ func (h *Handler) process(ctx context.Context, ev Event) error {
 		return err
 	}
 
-	if h.cfg.DryRun {
-		log.Printf("event %s: dry-run: page %s %q would be %q", ev.ID, page.ID, title, category)
-		return nil
-	}
 	if catProp.Select != nil && catProp.Select.Name == category {
 		return skip("category already %q", category)
 	}
@@ -268,7 +277,7 @@ func (h *Handler) saveUsage(ctx context.Context, eventID, pageID, category strin
 		EventID: eventID, Time: time.Now().UTC(), PageID: pageID, Model: u.Model,
 		InputTokens: u.InputTokens, OutputTokens: u.OutputTokens,
 		CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens,
-		Category: category, DryRun: h.cfg.DryRun,
+		Category: category, DryRun: h.cfg.DryRun, Estimated: u.Estimated,
 	})
 	if err != nil {
 		log.Printf("event %s: %v", eventID, err)
